@@ -1,73 +1,92 @@
--- 확장 기능: UUID 자동 생성을 위한 pgcrypto 활성화
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+# docker.md
 
--- ==========================================
--- 1. 사용자 계정 (Users)
--- ==========================================
-CREATE TABLE users (
-    user_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    oauth_provider VARCHAR(20) NOT NULL, -- 'GOOGLE', 'APPLE' 등
-    oauth_id VARCHAR(255) NOT NULL UNIQUE, -- 제공자가 주는 고유 식별자
-    email VARCHAR(255),
-    nickname VARCHAR(50),
-    role VARCHAR(20) DEFAULT 'USER',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX idx_users_oauth ON users(oauth_provider, oauth_id);
+# Docker 운영 가이드 — AutoForge
 
--- ==========================================
--- 2. AI 작업 메인 테이블 (Aggregate Root)
--- ==========================================
--- 유저의 요청 한 건에 대한 전체 상태와 결과를 관리합니다.
-CREATE TABLE ai_tasks (
-    task_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    requirements TEXT NOT NULL,          -- 유저가 입력한 초기 요구사항
-    status VARCHAR(30) NOT NULL,         -- PENDING, PROCESSING, COMPLETED, FAILED
-    total_score DECIMAL(5,2),            -- 협의체가 매긴 최종 합산 점수
-    final_artifact_url VARCHAR(512),     -- 완성된 코드의 압축 파일(S3 등) 다운로드 링크
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX idx_ai_tasks_user_id ON ai_tasks(user_id);
-CREATE INDEX idx_ai_tasks_status ON ai_tasks(status);
+## Dockerfile (Multi-Stage, Java 21, Non-Root)
 
--- ==========================================
--- 3. 워크플로우 단계 로그 (Workflow Steps)
--- ==========================================
--- 오케스트레이터가 각 에이전트(보안, 성능 등)를 호출한 상세 이력입니다.
-CREATE TABLE task_workflow_steps (
-    step_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    task_id UUID NOT NULL REFERENCES ai_tasks(task_id) ON DELETE CASCADE,
-    step_sequence INT NOT NULL,          -- 실행 순서 (1, 2, 3...)
-    agent_type VARCHAR(50) NOT NULL,     -- ORCHESTRATOR, ANALYZER, DRAFTER, SECURITY...
-    prompt_input TEXT NOT NULL,          -- 모델에게 전달된 프롬프트
-    response_output TEXT,                -- 모델이 답변한 원문 (수정 요청사항 등)
-    status VARCHAR(20) NOT NULL,         -- SUCCESS, FAILED, TIMEOUT
-    execution_time_ms BIGINT,            -- AI 응답에 걸린 시간
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX idx_workflow_steps_task ON task_workflow_steps(task_id, step_sequence);
+```dockerfile
+FROM eclipse-temurin:21-jdk-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN ./gradlew clean bootJar --no-daemon
 
--- ==========================================
--- 4. 화이트보드 코드 스냅샷 (Code Snapshots)
--- ==========================================
--- AI가 코드를 수정할 때마다 버전을 기록하여, 가장 점수가 높은 버전을 추적합니다.
-CREATE TABLE code_snapshots (
-    snapshot_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    task_id UUID NOT NULL REFERENCES ai_tasks(task_id) ON DELETE CASCADE,
-    iteration_count INT NOT NULL,        -- 몇 번째 수정 버전인지 (1, 2, 3...)
-    source_code TEXT NOT NULL,           -- 해당 시점의 전체 소스 코드
-    
-    -- 각 에이전트의 평가 결과 (유연성을 위해 JSONB 사용)
-    -- 예: {"security": 85, "performance": 90, "stability": 75}
-    evaluation_scores JSONB,             
-    
-    -- 피드백 상세 내용 (수정해야 할 부분 등)
-    feedback_notes JSONB,                
-    
-    is_best_version BOOLEAN DEFAULT FALSE, -- 현재까지 가장 완성도가 높은 버전인지 여부
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX idx_code_snapshots_task_iter ON code_snapshots(task_id, iteration_count);
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+RUN addgroup -S spring && adduser -S spring -G spring
+USER spring:spring
+COPY --from=builder /app/build/libs/autoforge-backend-*.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-XX:+UseZGC", "-XX:+ZGenerational", "-jar", "app.jar"]
+```
+
+## Nginx — `nginx/default.conf`
+
+```nginx
+server {
+    listen 80;
+    server_name api.autoforge.com;
+
+    location /api/ {
+        proxy_pass         http://autoforge-api:8080;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+
+        proxy_buffering           off;
+        proxy_cache               off;
+        proxy_set_header          Connection '';
+        proxy_http_version        1.1;
+        chunked_transfer_encoding off;
+        proxy_read_timeout        1800s;
+    }
+}
+```
+
+> SSL 적용 시 `listen 443 ssl http2;` 로 변경하고 인증서 경로를 추가합니다.
+
+## 환경 변수 파일 (`.env`)
+
+프로젝트 루트에 `.env` 파일을 생성하고 아래 값을 채웁니다. `.env`는 절대 Git에 커밋하지 않습니다.
+
+```env
+JWT_SECRET=your-very-long-random-secret-key
+LLM_OPENAI_API_KEY=sk-...
+LLM_ANTHROPIC_API_KEY=sk-ant-...
+S3_BUCKET_NAME=autoforge-artifacts
+S3_REGION=ap-northeast-2
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+```
+
+## 명령어
+
+```bash
+# 전체 스택 빌드 및 실행
+docker compose up --build -d
+
+# API 서버 로그 실시간 확인
+docker compose logs -f api
+
+# 스택 중지
+docker compose down
+
+# 볼륨까지 초기화 (DB 데이터 삭제)
+docker compose down -v
+
+# 특정 서비스만 재시작
+docker compose restart api
+
+# 컨테이너 내부 접속
+docker compose exec postgres psql -U autoforge_user -d autoforge
+docker compose exec redis redis-cli
+```
+
+## 헬스체크 흐름
+
+```
+Docker Compose 시작
+  → postgres: pg_isready 통과 (service_healthy)
+  → redis:    redis-cli ping 통과 (service_healthy)
+  → api:      depends_on 조건 만족 후 기동
+  → nginx:    api 기동 후 라우팅 시작
+```
